@@ -12,6 +12,7 @@ __host__ __device__ __forceinline__ T ATenCeilDiv(T a, T b) {
     return (a + b - 1) / b;
 }
 
+// sum number of nonzero elements in each block with reduce
 template<typename T, int BLOCK_THREADS>
 __global__ void nonZeroCountKernel(const T *inputs, int64_t length, int *counts) {
     typedef cub::BlockReduce<int, BLOCK_THREADS, cub::BLOCK_REDUCE_RAKING_COMMUTATIVE_ONLY> BlockReduceT;
@@ -23,6 +24,7 @@ __global__ void nonZeroCountKernel(const T *inputs, int64_t length, int *counts)
         num++;
     }
     int aggregate = BlockReduceT(temp_storage).Sum(num);
+    // record aggregated count number by thread 0
     if (threadIdx.x == 0) {
         counts[blockIdx.x] = aggregate;
     }
@@ -41,7 +43,7 @@ __global__ void nonZeroIndexKernel(const T *inputs, int64_t length, const int *c
     BlockScanT(temp_storage).ExclusiveSum(num, nonzero);
     if (index < length && cast_to_bool(inputs[index])) {
         int offset = blockIdx.x ? cumulativeCounts[blockIdx.x - 1] : 0;
-        output[nonzero + offset] = index;
+        output[offset + nonzero] = index;
     }
 }
 
@@ -60,28 +62,28 @@ int devicePrint(const T *deviceValues, int length, const std::string &info, int 
     cudaMemcpy(values, deviceValues, sizeof(T) * length, cudaMemcpyDeviceToHost);
     std::cout << info << ": ";
     for (int i = 0; i < length; i++) {
-        std::cout << values[i] << " ";
         if (step != 1) {
-            if (!((i + 1) % step)) {
+            if (!(i % step)) {
                 std::cout << std::endl;
             }
         }
+        std::cout << values[i] << " ";
     }
     std::cout << std::endl;
     free(values);
     return 0;
 }
 
-
+// Apply nonzero opeartion to scores, gather scores and boxes with returned nonzero indices.
 cudaError_t nonzero(float *scores, float *boxes, int length) {
-    // inputs
+    // inputs: copy scores and boxes to device
     float *deviceScores, *deviceBoxes;
     cudaMalloc(&deviceScores, sizeof(float) * length);
     cudaMalloc(&deviceBoxes, sizeof(float) * length * 4);
     cudaMemcpy(deviceScores, scores, sizeof(float) * length, cudaMemcpyHostToDevice);
     cudaMemcpy(deviceBoxes, boxes, sizeof(float) * length * 4, cudaMemcpyHostToDevice);
 
-    // outputs
+    // malloc space for nonzero block counts & cumulative counts
     int blockNum = ATenCeilDiv(length, RUNTIME_BLOCK_THREADS);
     int *devicesCounts, *devicesCumulativeCounts;
     cudaMalloc(&devicesCounts, sizeof(int) * blockNum);
@@ -90,10 +92,10 @@ cudaError_t nonzero(float *scores, float *boxes, int length) {
     // count number of nonzero elements by block
     dim3 grid(blockNum);
     dim3 block(RUNTIME_BLOCK_THREADS);
-    nonZeroCountKernel<float, RUNTIME_BLOCK_THREADS><<< grid, block>>>(deviceScores, (int64_t) length, devicesCounts);
+    nonZeroCountKernel<float, RUNTIME_BLOCK_THREADS><<<grid, block>>>(deviceScores, (int64_t)length, devicesCounts);
     devicePrint(devicesCounts, blockNum, std::string("counts"), 1);
 
-    // combine number of nonzero elements
+    // inclusive sum number of nonzero elements for each block
     void *d_temp_storage = NULL;
     size_t temp_storage_bytes = 0;
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, devicesCounts, devicesCumulativeCounts, blockNum);
@@ -101,21 +103,21 @@ cudaError_t nonzero(float *scores, float *boxes, int length) {
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, devicesCounts, devicesCumulativeCounts, blockNum);
     devicePrint(devicesCumulativeCounts, blockNum, std::string("cumulativeCounts"), 1);
 
-    // return nonzero indices
+    // retrieve nonzero indices
     int nonzeroCount, *nonzeroIndex;
-    cudaMemcpy(&nonzeroCount, devicesCumulativeCounts + blockNum - 1, 1, cudaMemcpyDeviceToHost);
+    cudaMemcpy(&nonzeroCount, devicesCumulativeCounts + blockNum - 1, sizeof(int), cudaMemcpyDeviceToHost);
     std::cout << "nonzeroCount: " << nonzeroCount << std::endl;
     cudaMalloc(&nonzeroIndex, sizeof(int) * nonzeroCount);
     nonZeroIndexKernel<float, RUNTIME_BLOCK_THREADS><<<grid, block>>>(
-            deviceScores, (int64_t) length, devicesCumulativeCounts, nonzeroIndex);
+        deviceScores, (int64_t)length, devicesCumulativeCounts, nonzeroIndex);
     devicePrint(nonzeroIndex, nonzeroCount, std::string("nonzero"), 1);
 
     // retrieve nonzero elements
     float *outputScores, *outputBoxes;
     cudaMalloc(&outputScores, sizeof(float) * nonzeroCount);
     cudaMalloc(&outputBoxes, sizeof(float) * nonzeroCount * 4);
-    gatherKernel<<< grid, block>>>(deviceScores, nonzeroIndex, outputScores, nonzeroCount, 1);
-    gatherKernel<<< grid, block>>>(deviceBoxes, nonzeroIndex, outputBoxes, nonzeroCount, 4);
+    gatherKernel<<<grid, block>>>(deviceScores, nonzeroIndex, outputScores, nonzeroCount, 1);
+    gatherKernel<<<grid, block>>>(deviceBoxes, nonzeroIndex, outputBoxes, nonzeroCount, 4);
     devicePrint(outputScores, nonzeroCount, std::string("scores"), 1);
     devicePrint(outputBoxes, nonzeroCount * 4, std::string("boxes"), 4);
 
