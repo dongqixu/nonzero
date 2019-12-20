@@ -12,4 +12,4 @@ include_directories(
 
 set(CMAKE_CXX_STANDARD 14)
 
-add_executable(nonzero main.cpp nonzero.cu)
+add_executable(nonzero main.cpp nms.cu nonzero.cu)
